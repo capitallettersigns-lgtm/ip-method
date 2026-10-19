@@ -163,6 +163,13 @@ const DAYNAME = {A:'Squat + Bench',B:'Overhead press + Row',C:'Deadlift + Pull-u
 const TREE = D.tree; const TREEBYID = {}; TREE.forEach(t => TREEBYID[t.id] = t);
 const isAcc = id => SLOTDEF[id].type === 'Accessory';
 const isPullUp = ex => /pull-up|chin-up/i.test(ex);
+/* Barbell lifts use an Olympic bar: never suggest less than the empty bar (20 kg).
+   Smith machine, dumbbell, kettlebell, landmine, T-bar, cable and machine lifts are excluded. */
+const BAR_KG = 20;
+const BARBELL_RE = /barbell|deadlift|\bRDL\b|back squat|front squat|safety-bar squat|pin squat|hip thrust|bench press|overhead press|pin press|Pendlay|Spoto|Larsen|Z press/i;
+const NOT_BARBELL_RE = /smith|dumbbell|kettlebell|landmine|machine|cable|T-bar|banded|single-arm|single-leg|hack|leg press|viking|pull-up|chin-up/i;
+const isBarbell = ex => !!ex && BARBELL_RE.test(ex) && !NOT_BARBELL_RE.test(ex);
+const barMin = (ex, kg) => (isNum(kg) && isBarbell(ex)) ? Math.max(BAR_KG, kg) : kg;
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -175,6 +182,7 @@ const kgf = x => (x == null || x === '' || isNaN(x)) ? '–' : String(r2(+x));
 const e1rm = (kg, reps) => (isNum(kg) && isNum(reps) && reps > 0 && reps < 37) ? r1(kg * 36 / (37 - reps)) : null;
 // Back-off, as the sheet: ROUND(N*0.8/1.25,0)*1.25
 const plate = x => Math.round(x * 0.8 / 1.25) * 1.25;
+const backOff = (ex, x) => barMin(ex, plate(x));   // max(20, round(80%)) for barbell lifts
 // Start weight, as the sheet: FLOOR(e1RM*(37-top)/36, 1.25)
 const floor125 = x => Math.floor(x / 1.25 + 1e-9) * 1.25;
 const startFromE1 = (e, top) => floor125(e * (37 - top) / 36);
@@ -213,7 +221,7 @@ const LC = id => S.lifecycles.find(l => l.id === id);
 function lcLogs(lcId) { return S.logs.filter(l => l.lc === lcId).sort(byDate); }
 
 function evalLc(lcId) {
-  const lc = LC(lcId), sl = S.slots[lc.slot];
+  const lc = LC(lcId), sl = S.slots[lc.slot], ex = lc.ex || sl.ex;
   const jump = sl.jump, bottom = sl.bottom, top = sl.top;
   const rows = lcLogs(lcId); const out = [];
   rows.forEach((l, i) => {
@@ -230,8 +238,8 @@ function evalLc(lcId) {
     else if (wk > 1 && prev && prev.reps - l.reps >= 2) status = 'WATCH - reps fell 2+';
     else if (wk === 1) status = 'START';
     else status = 'PROGRESSING';
-    const next = status.startsWith('ROTATE') ? null : r2(l.kg + jump);
-    out.push({log:l, wk, e1:e1rm(l.kg, l.reps), flag, status, next, nextBo: next == null ? null : plate(next)});
+    const next = status.startsWith('ROTATE') ? null : barMin(ex, r2(l.kg + jump));
+    out.push({log:l, wk, e1:e1rm(l.kg, l.reps), flag, status, next, nextBo: next == null ? null : backOff(ex, next)});
   });
   return out;
 }
@@ -247,9 +255,9 @@ function slotInfo(id) {
   }
   const lc = LC(sl.lc); const ev = evalLc(sl.lc); const last = ev[ev.length - 1];
   const status = last ? last.status : 'NEW';
-  const target = last ? last.next : lc.startKg;
+  const ex = lc.ex || sl.ex, target = last ? last.next : barMin(ex, lc.startKg);
   return {sl, def, lc, ev, last, status, rotate:status.startsWith('ROTATE'), target, wk:ev.length + 1,
-    backoff: isNum(target) ? plate(target) : null, pull:isPullUp(sl.ex)};
+    backoff: isNum(target) ? backOff(ex, target) : null, pull:isPullUp(sl.ex), barbell:isBarbell(ex)};
 }
 const stCls = s => s.startsWith('ROTATE') ? 'ROTATE' : s.startsWith('WATCH') ? 'WATCH' : s === 'ADD WEIGHT' ? 'ADD' : (s === 'NEW' || s === 'BUILD REPS') ? 'NEW' : s;
 const stLabel = s => s === 'NEW' ? 'NOT STARTED' : s.replace(' - ', ' · ');
@@ -465,8 +473,9 @@ function amrapCalc() {
   if (!SHEETCTX) return;
   const kg = numOrNull($('#am-kg').value), reps = numOrNull($('#am-reps').value), o = $('#am-out'), top = S.slots[SHEETCTX.id].top;
   if (!isNum(kg) || !isNum(reps) || reps <= 0 || reps >= 37) { o.innerHTML = ''; return; }
-  const e = e1rm(kg, reps), st = startFromE1(e, top);
-  o.innerHTML = `Est. 1RM (Brzycki) <b>${kgf(e)} kg</b> → start for ${top} reps: <b style="color:var(--acc)">${kgf(st)} kg</b> <button class="btn sm" data-act="usecalc" data-v="${st}" style="margin-left:6px">Use</button>`;
+  const ex = SHEETCTX.kind === 'rot' ? (SHEETCTX.choice && SHEETCTX.choice.ex) : (LC(S.slots[SHEETCTX.id].lc).ex || S.slots[SHEETCTX.id].ex);
+  const e = e1rm(kg, reps), raw = startFromE1(e, top), st = barMin(ex, raw);
+  o.innerHTML = `Est. 1RM (Brzycki) <b>${kgf(e)} kg</b> → start for ${top} reps: <b style="color:var(--acc)">${kgf(st)} kg</b>${st !== raw ? ' <span class="tiny mut">(empty bar minimum)</span>' : ''} <button class="btn sm" data-act="usecalc" data-v="${st}" style="margin-left:6px">Use</button>`;
 }
 
 function rotateFlow(id, early) { SHEETCTX = {kind:'rot', id, step:1, reason:null, choice:null, manual:false, early:!!early, rating:null}; renderRot(); }
@@ -541,7 +550,7 @@ function renderRot() {
 }
 function confirmRotation() {
   const c = SHEETCTX, id = c.id, sl = S.slots[id], lc = LC(sl.lc), ch = c.choice;
-  const startKg = numOrNull($('#st-kg').value);
+  const entered = numOrNull($('#st-kg').value), startKg = barMin(ch.ex, entered);
   Object.assign(lc, {closed:true, endReason:c.reason || null, rating:c.rating, note:($('#rot-note').value || '').trim(), closedOn:todayISO()});
   let treeRowId = ch.row ? ch.row.id : null;
   if (!treeRowId && ch.role === 'Reinforce') { const r = TREE.find(t => t.reinforce === ch.ex && t.ex === lc.ex && t.reason === c.reason) || TREE.find(t => t.reinforce === ch.ex); if (r) treeRowId = r.id; }
@@ -551,7 +560,7 @@ function confirmRotation() {
   Object.assign(sl, {ex:ch.ex, role:ch.role, lc:nl.id});
   if (ch.role === 'Anchor') sl.anchor = ch.ex;
   if (S.draft && S.draft.entries[id]) S.draft.entries[id] = draftEntry(id);
-  save(); closeSheet(); render(); toast('New lifecycle: ' + ch.ex + ' (' + ch.role + ')');
+  save(); closeSheet(); render(); toast('New lifecycle: ' + ch.ex + ' (' + ch.role + ')' + (startKg !== entered ? ' · start set to the 20 kg empty bar' : ''));
   syncSoon();
 }
 
@@ -761,12 +770,13 @@ function doImport(file) {
    so the token never ends up in Export backups or in anything written to the repo. */
 const SYNC_KEY = 'ipMethodJosh.sync.v1';
 const GH_API = 'https://api.github.com';
-let SYNC = {token:'', owner:'capitallettersigns-lgtm', repo:'ip-method-logs', lastSync:null, lastError:null, pending:{state:false, sessions:[]}};
+let SYNC = {token:'', owner:'capitallettersigns-lgtm', repo:'ip-method-logs', lastSync:null, lastError:null, pending:{state:false, sessions:[]}, sessFiles:{}};
 let syncTimer = null, syncBusy = false;
 
 function syncLoad() {
   try { const raw = localStorage.getItem(SYNC_KEY); if (raw) SYNC = Object.assign(SYNC, JSON.parse(raw)); } catch (e) { /* keep defaults */ }
   if (!SYNC.pending) SYNC.pending = {state:false, sessions:[]};
+  if (!SYNC.sessFiles || typeof SYNC.sessFiles !== 'object') SYNC.sessFiles = {};   // path -> hash of the content last written
 }
 function syncSave() { try { localStorage.setItem(SYNC_KEY, JSON.stringify(SYNC)); } catch (e) { /* ignore */ } }
 const syncOn = () => !!(SYNC.token && SYNC.owner && SYNC.repo);
@@ -792,17 +802,19 @@ async function gh(method, path, body, accept) {
   return res;
 }
 const contentsPath = p => `/repos/${encodeURIComponent(SYNC.owner)}/${encodeURIComponent(SYNC.repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`;
-async function getSha(path) {
+function unb64utf8(b64) { try { const bin = atob(String(b64).replace(/\s/g, '')); return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))); } catch (e) { return null; } }
+async function getRemote(path) {
   const r = await gh('GET', contentsPath(path));
   if (r.status === 404) return null;
   if (!r.ok) throw new SyncError('http', 'GitHub error ' + r.status + ' reading ' + path, r.status);
-  const j = await r.json(); return j.sha || null;
+  const j = await r.json(); return {sha:j.sha || null, text:j.content != null ? unb64utf8(j.content) : null};
 }
 /* GET sha -> PUT; 404 = create; 409/422 = refetch sha and retry once */
 async function putFile(path, text, message) {
   const content = b64utf8(text);
   for (let attempt = 0; attempt < 2; attempt++) {
-    const sha = await getSha(path);
+    const cur = await getRemote(path), sha = cur && cur.sha;
+    if (cur && cur.text === text) return true;          // already identical on GitHub: no empty commit
     const r = await gh('PUT', contentsPath(path), sha ? {message, content, sha} : {message, content});
     if (r.ok) return true;
     if ((r.status === 409 || r.status === 422) && attempt === 0) continue;
@@ -813,7 +825,25 @@ async function putFile(path, text, message) {
 
 /* ---------- what gets written ---------- */
 function backupJSON() { return JSON.stringify({app:'ip-method-josh', exported:new Date().toISOString(), data:S}, null, 1); }
-function sessionPath(s) { return `data/sessions/${s.date}-day-${s.day}.json`; }
+/* data/sessions/YYYY-MM-DD-day-X.json; a second session with the same date + day gets -2, -3 … (ordered by seq) */
+function sessionPaths() {
+  const seen = {}, out = {};
+  [...S.sessions].sort((a, b) => (a.seq || 0) - (b.seq || 0)).forEach(s => {
+    const base = `data/sessions/${s.date}-day-${s.day}`; seen[base] = (seen[base] || 0) + 1;
+    out[s.id] = base + (seen[base] > 1 ? '-' + seen[base] : '') + '.json';
+  });
+  return out;
+}
+function sessionPath(s) { return sessionPaths()[s.id]; }
+function hashStr(str) { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(16) + ':' + str.length; }
+/* Every finished session whose file hasn't been written (or whose content changed) – this backfills
+   sessions finished before sync was set up, or while a sync failed. */
+function sessionsToWrite() {
+  const paths = sessionPaths();
+  return S.sessions.map(s => { const path = paths[s.id], text = sessionJSON(s); return {s, path, text, h:hashStr(text)}; })
+    .filter(x => SYNC.sessFiles[x.path] !== x.h);
+}
+const syncNeeded = () => syncOn() && (SYNC.pending.state || SYNC.pending.sessions.length > 0 || sessionsToWrite().length > 0);
 function sessionJSON(s) {
   const logs = S.logs.filter(l => l.sid === s.id).sort(byDate);
   const exercises = logs.map(l => {
@@ -842,17 +872,24 @@ function syncSoon(sid) {
   if (sid && !SYNC.pending.sessions.includes(sid)) SYNC.pending.sessions.push(sid);
   syncSave(); clearTimeout(syncTimer); syncTimer = setTimeout(() => runSync(), 1200);
 }
+let syncRun = null;
 async function runSync(manual) {
-  if (!syncOn() || syncBusy) return false;
+  if (!syncOn()) return false;
+  if (syncBusy) { if (!manual) return false; try { await syncRun; } catch (e) { /* ignore */ } return runSync(manual); }   // Sync now during an auto-sync: wait, then run
+  syncRun = runSyncOnce(manual); return syncRun;
+}
+async function runSyncOnce(manual) {
   if (manual) { SYNC.pending.state = true; }
-  if (!SYNC.pending.state && !SYNC.pending.sessions.length) return true;
+  const todo = sessionsToWrite();
+  if (!SYNC.pending.state && !SYNC.pending.sessions.length && !todo.length) return true;
   syncBusy = true; syncIndicator();
   try {
-    for (const sid of [...SYNC.pending.sessions]) {
-      const s = S.sessions.find(x => x.id === sid);
-      if (s) await putFile(sessionPath(s), sessionJSON(s), `Session ${s.date} Day ${s.day}`);
-      SYNC.pending.sessions = SYNC.pending.sessions.filter(x => x !== sid); syncSave();
+    for (const x of todo) {
+      await putFile(x.path, x.text, `Session ${x.s.date} Day ${x.s.day}`);
+      SYNC.sessFiles[x.path] = x.h;
+      SYNC.pending.sessions = SYNC.pending.sessions.filter(id => id !== x.s.id); syncSave();
     }
+    SYNC.pending.sessions = SYNC.pending.sessions.filter(id => S.sessions.some(s => s.id === id));  // drop ids of deleted sessions
     await putFile('data/state.json', backupJSON(), 'Update state backup');
     await putFile('data/summary.md', summaryMD(), 'Update summary');
     SYNC.pending.state = false; SYNC.lastSync = new Date().toISOString(); SYNC.lastError = null; syncSave();
@@ -879,7 +916,7 @@ const fmtDT = iso => iso ? new Date(iso).toLocaleString('en-GB', {day:'numeric',
 function syncStatusText() {
   if (!syncOn()) return 'Off – your data stays on this phone only';
   if (syncBusy) return 'Syncing…';
-  const pend = (SYNC.pending.state || SYNC.pending.sessions.length) ? ' · changes waiting' : '';
+  const pend = (SYNC.pending.state || SYNC.pending.sessions.length || sessionsToWrite().length) ? ' · changes waiting' : '';
   if (SYNC.lastError) return (SYNC.lastError.kind === 'auth' ? '⚠ Token invalid or missing permission' : SYNC.lastError.kind === 'offline' ? 'Offline – will retry' : '⚠ ' + SYNC.lastError.msg) + pend;
   return 'Last synced ' + fmtDT(SYNC.lastSync) + pend;
 }
@@ -887,9 +924,9 @@ function syncIndicator() { document.querySelectorAll('[data-sync-status]').forEa
 function syncInit() {
   syncLoad();
   window.addEventListener('online', () => { if (syncOn()) runSync(); });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && syncOn() && (SYNC.pending.state || SYNC.pending.sessions.length)) runSync(); });
-  setInterval(() => { if (syncOn() && (SYNC.pending.state || SYNC.pending.sessions.length) && navigator.onLine !== false) runSync(); }, 60000);
-  if (syncOn() && (SYNC.pending.state || SYNC.pending.sessions.length)) setTimeout(() => runSync(), 1500);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && syncNeeded()) runSync(); });
+  setInterval(() => { if (navigator.onLine !== false && syncNeeded()) runSync(); }, 60000);
+  setTimeout(() => { if (syncNeeded()) runSync(); }, 1500);   // also backfills missing session files on app open
 }
 
 /* ===== sync-ui.js ===== */
@@ -927,6 +964,7 @@ const SYNC_ACTIONS = {
     const tok = ($('#sy-token').value || '').trim(), owner = ($('#sy-owner').value || '').trim(), repo = ($('#sy-repo').value || '').trim();
     if (!owner || !repo) { toast('Enter owner and repo'); return; }
     if (tok) { SYNC.token = tok; SYNC.lastError = null; }
+    if (owner !== SYNC.owner || repo !== SYNC.repo) SYNC.sessFiles = {};   // new repo: write every session file again
     SYNC.owner = owner; SYNC.repo = repo; syncSave();
     openSyncSheet({ok:true, text:SYNC.token ? 'Saved. Tap Test connection to check it.' : 'Saved (no token yet).'}); render();
   },
@@ -957,7 +995,7 @@ const SYNC_ACTIONS = {
   },
   syncclear: () => {
     if (!confirm('Disconnect GitHub sync and forget the token on this phone? Your workout data is not affected.')) return;
-    SYNC.token = ''; SYNC.lastError = null; SYNC.pending = {state:false, sessions:[]}; syncSave(); openSyncSheet({ok:true, text:'Disconnected. Token removed from this phone.'}); render();
+    SYNC.token = ''; SYNC.lastError = null; SYNC.pending = {state:false, sessions:[]}; SYNC.sessFiles = {}; syncSave(); openSyncSheet({ok:true, text:'Disconnected. Token removed from this phone.'}); render();
   }
 };
 
@@ -1036,7 +1074,8 @@ const ACTIONS = {
   setstart: v => { closeSheet(); startSheet(v); },
   savestart: () => {
     const kg = numOrNull($('#st-kg').value); if (!isNum(kg)) { toast('Enter a weight'); return; }
-    const id = SHEETCTX.id, lc = LC(S.slots[id].lc); lc.startKg = kg;
+    const id = SHEETCTX.id, lc = LC(S.slots[id].lc); lc.startKg = barMin(lc.ex || S.slots[id].ex, kg);
+    if (lc.startKg !== kg) setTimeout(() => toast('Barbell lift: start set to the 20 kg empty bar'), 1600);
     if (S.draft && S.draft.entries[id] && !lcLogs(lc.id).length) S.draft.entries[id] = draftEntry(id);
     save(); closeSheet(); render(); toast('Start weight saved'); syncSoon();
   },
