@@ -433,6 +433,7 @@ function finishSession() {
   if (!results.length) { toast('Nothing logged yet – enter top-set reps first'); return; }
   S.sessions.push({id:sid, seq:Date.now(), date:dr.date, day:dr.day, n:results.length});
   S.draft = null; save(); render(); showSummary(results);
+  syncSoon(sid);
 }
 function showSummary(ids) {
   const rows = ids.map(id => {
@@ -551,11 +552,12 @@ function confirmRotation() {
   if (ch.role === 'Anchor') sl.anchor = ch.ex;
   if (S.draft && S.draft.entries[id]) S.draft.entries[id] = draftEntry(id);
   save(); closeSheet(); render(); toast('New lifecycle: ' + ch.ex + ' (' + ch.role + ')');
+  syncSoon();
 }
 
 function vPlan() {
   setHeader('Plan', '3-day full body · IP Method');
-  let h = `<h2>Your programme</h2><p class="small mut">Key movements first, then secondaries, then accessories. Every compound: one top set + two strict back-off sets at ~80%.</p>`;
+  let h = syncCard() + `<h2>Your programme</h2><p class="small mut">Key movements first, then secondaries, then accessories. Every compound: one top set + two strict back-off sets at ~80%.</p>`;
   ['A', 'B', 'C'].forEach(d => {
     h += `<h3>Day ${d} · ${DAYNAME[d]}</h3>`;
     DAYS[d].forEach(id => {
@@ -719,6 +721,7 @@ function vMore() {
   <h3>Your data</h3><div class="card small"><p class="mut" style="margin-top:0">Everything is stored only in this browser on this device. Export a backup regularly, especially before clearing browser data or changing phone.</p>
   <div class="btns"><button class="btn" data-act="export">Export backup</button><button class="btn" data-act="import">Import backup</button></div><input type="file" id="impfile" accept="application/json,.json" style="display:none">
   <div class="btns"><button class="btn dan" data-act="reset">Reset all data</button></div>
+  <p class="small">☁ GitHub sync: <span data-sync-status>${esc(syncStatusText())}</span> <button class="link" data-act="syncsettings">Settings</button></p>
   <p class="tiny mut">${S.logs.length} logs · ${S.lifecycles.length} lifecycles · started ${fmtD(S.created)}</p></div>
   <div class="card small"><b>Add to home screen</b><p class="mut" style="margin:6px 0 0">iPhone: open the file in Safari → Share → <i>Add to Home Screen</i>. Android: Chrome menu → <i>Add to Home screen</i>. Works offline.</p></div>
   <p class="tiny mut" style="text-align:center">Based on Jon Walland's public YouTube videos. Not medical advice – if something hurts, stop and get it checked.</p>`;
@@ -750,6 +753,213 @@ function doImport(file) {
   };
   rd.readAsText(file);
 }
+
+/* ===== sync.js ===== */
+'use strict';
+/* Optional GitHub sync (REST contents API, straight from the browser).
+   Settings live under their own localStorage key, separate from the workout data (KEY),
+   so the token never ends up in Export backups or in anything written to the repo. */
+const SYNC_KEY = 'ipMethodJosh.sync.v1';
+const GH_API = 'https://api.github.com';
+let SYNC = {token:'', owner:'capitallettersigns-lgtm', repo:'ip-method-logs', lastSync:null, lastError:null, pending:{state:false, sessions:[]}};
+let syncTimer = null, syncBusy = false;
+
+function syncLoad() {
+  try { const raw = localStorage.getItem(SYNC_KEY); if (raw) SYNC = Object.assign(SYNC, JSON.parse(raw)); } catch (e) { /* keep defaults */ }
+  if (!SYNC.pending) SYNC.pending = {state:false, sessions:[]};
+}
+function syncSave() { try { localStorage.setItem(SYNC_KEY, JSON.stringify(SYNC)); } catch (e) { /* ignore */ } }
+const syncOn = () => !!(SYNC.token && SYNC.owner && SYNC.repo);
+
+class SyncError extends Error { constructor(kind, msg, status) { super(msg); this.kind = kind; this.status = status; } }
+const AUTH_MSG = 'Token invalid or missing permission. Check it has access to the repo with Contents = Read and write, and hasn’t expired.';
+
+function b64utf8(str) {
+  const bytes = new TextEncoder().encode(str); let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+async function gh(method, path, body, accept) {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) throw new SyncError('offline', 'You’re offline – will retry when back online.');
+  let res;
+  try {
+    res = await fetch(GH_API + path, {method, cache:'no-store', headers:{
+      'Authorization':'Bearer ' + SYNC.token, 'Accept':accept || 'application/vnd.github+json',
+      'X-GitHub-Api-Version':'2022-11-28', ...(body ? {'Content-Type':'application/json'} : {})},
+      body: body ? JSON.stringify(body) : undefined});
+  } catch (e) { throw new SyncError('offline', 'Couldn’t reach GitHub (offline?) – will retry later.'); }
+  if (res.status === 401 || res.status === 403) throw new SyncError('auth', AUTH_MSG, res.status);
+  return res;
+}
+const contentsPath = p => `/repos/${encodeURIComponent(SYNC.owner)}/${encodeURIComponent(SYNC.repo)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`;
+async function getSha(path) {
+  const r = await gh('GET', contentsPath(path));
+  if (r.status === 404) return null;
+  if (!r.ok) throw new SyncError('http', 'GitHub error ' + r.status + ' reading ' + path, r.status);
+  const j = await r.json(); return j.sha || null;
+}
+/* GET sha -> PUT; 404 = create; 409/422 = refetch sha and retry once */
+async function putFile(path, text, message) {
+  const content = b64utf8(text);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sha = await getSha(path);
+    const r = await gh('PUT', contentsPath(path), sha ? {message, content, sha} : {message, content});
+    if (r.ok) return true;
+    if ((r.status === 409 || r.status === 422) && attempt === 0) continue;
+    if (r.status === 404) throw new SyncError('notfound', 'Repo not found – check owner/repo and that the token can access it.', 404);
+    throw new SyncError('http', 'GitHub error ' + r.status + ' writing ' + path, r.status);
+  }
+}
+
+/* ---------- what gets written ---------- */
+function backupJSON() { return JSON.stringify({app:'ip-method-josh', exported:new Date().toISOString(), data:S}, null, 1); }
+function sessionPath(s) { return `data/sessions/${s.date}-day-${s.day}.json`; }
+function sessionJSON(s) {
+  const logs = S.logs.filter(l => l.sid === s.id).sort(byDate);
+  const exercises = logs.map(l => {
+    if (l.acc) return {slot:l.slot, exercise:l.ex, type:'accessory', sets:l.sets.map(x => ({kg:x[0], reps:x[1]}))};
+    const lc = LC(l.lc); const row = lc ? evalLc(lc.id).find(r => r.log.id === l.id) : null;
+    return {slot:l.slot, exercise:l.ex, role:l.role, week:row ? row.wk : null, topSet:{kg:l.kg, reps:l.reps}, e1RM:row ? row.e1 : e1rm(l.kg, l.reps),
+      backOffs:(l.bo || []).map(b => ({kg:b[0], reps:b[1]})), status:row ? row.status : null, nextTopSetKg:row ? row.next : null, note:l.note || ''};
+  });
+  return JSON.stringify({date:s.date, dateUK:fmtD(s.date), day:s.day, dayName:DAYNAME[s.day], exercises}, null, 2);
+}
+function summaryMD() {
+  let md = `# IP Method – current status\n\nUpdated ${new Date().toLocaleString('en-GB')} · ${S.sessions.length} sessions logged\n\n| Slot | Exercise | Role | Status | Next top set |\n|---|---|---|---|---|\n`;
+  Object.keys(S.slots).filter(id => !isAcc(id)).forEach(id => {
+    const i = slotInfo(id);
+    md += `| ${id} | ${i.sl.ex} | ${i.lc.role} | ${stLabel(i.status)} | ${i.rotate ? 'rotate' : isNum(i.target) ? kgf(i.target) + ' kg' : '–'} |\n`;
+  });
+  md += `\n## Best 3 per pattern (est. 1RM gained)\n\n`;
+  PATTERNS.forEach(p => { const b = best3(p); md += `- **${p}:** ${b.length ? b.map(x => `${x.ex} (${x.best >= 0 ? '+' : ''}${kgf(x.best)} kg)`).join(', ') : 'no finished lifecycles yet'}\n`; });
+  return md;
+}
+
+/* ---------- queue + run ---------- */
+function syncSoon(sid) {
+  if (!syncOn()) return;                       // sync optional: nothing happens without a token
+  SYNC.pending.state = true;
+  if (sid && !SYNC.pending.sessions.includes(sid)) SYNC.pending.sessions.push(sid);
+  syncSave(); clearTimeout(syncTimer); syncTimer = setTimeout(() => runSync(), 1200);
+}
+async function runSync(manual) {
+  if (!syncOn() || syncBusy) return false;
+  if (manual) { SYNC.pending.state = true; }
+  if (!SYNC.pending.state && !SYNC.pending.sessions.length) return true;
+  syncBusy = true; syncIndicator();
+  try {
+    for (const sid of [...SYNC.pending.sessions]) {
+      const s = S.sessions.find(x => x.id === sid);
+      if (s) await putFile(sessionPath(s), sessionJSON(s), `Session ${s.date} Day ${s.day}`);
+      SYNC.pending.sessions = SYNC.pending.sessions.filter(x => x !== sid); syncSave();
+    }
+    await putFile('data/state.json', backupJSON(), 'Update state backup');
+    await putFile('data/summary.md', summaryMD(), 'Update summary');
+    SYNC.pending.state = false; SYNC.lastSync = new Date().toISOString(); SYNC.lastError = null; syncSave();
+    return true;
+  } catch (e) {
+    SYNC.lastError = {kind:e.kind || 'error', msg:e.message, at:new Date().toISOString()}; syncSave();
+    if (manual || e.kind === 'auth') toast(e.kind === 'auth' ? 'Sync failed: token invalid or missing permission' : 'Sync: ' + e.message);
+    return false;
+  } finally { syncBusy = false; syncIndicator(); }
+}
+async function testConnection() {
+  const r = await gh('GET', contentsPath('README.md'));
+  if (r.status === 404) { const r2 = await gh('GET', `/repos/${encodeURIComponent(SYNC.owner)}/${encodeURIComponent(SYNC.repo)}`); if (r2.status === 404) throw new SyncError('notfound', 'Repo not found – check owner/repo, and that the token was given access to it.', 404); }
+  else if (!r.ok) throw new SyncError('http', 'GitHub error ' + r.status, r.status);
+  return 'Connected – the token can read ' + SYNC.owner + '/' + SYNC.repo + '. Write access is confirmed on the first sync.';
+}
+async function fetchRemoteState() {
+  const r = await gh('GET', contentsPath('data/state.json'), null, 'application/vnd.github.raw+json');
+  if (r.status === 404) throw new SyncError('notfound', 'No data/state.json in the repo yet – sync once first.', 404);
+  if (!r.ok) throw new SyncError('http', 'GitHub error ' + r.status, r.status);
+  return importText(await r.text());
+}
+const fmtDT = iso => iso ? new Date(iso).toLocaleString('en-GB', {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'}) : 'never';
+function syncStatusText() {
+  if (!syncOn()) return 'Off – your data stays on this phone only';
+  if (syncBusy) return 'Syncing…';
+  const pend = (SYNC.pending.state || SYNC.pending.sessions.length) ? ' · changes waiting' : '';
+  if (SYNC.lastError) return (SYNC.lastError.kind === 'auth' ? '⚠ Token invalid or missing permission' : SYNC.lastError.kind === 'offline' ? 'Offline – will retry' : '⚠ ' + SYNC.lastError.msg) + pend;
+  return 'Last synced ' + fmtDT(SYNC.lastSync) + pend;
+}
+function syncIndicator() { document.querySelectorAll('[data-sync-status]').forEach(el => el.textContent = syncStatusText()); }
+function syncInit() {
+  syncLoad();
+  window.addEventListener('online', () => { if (syncOn()) runSync(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && syncOn() && (SYNC.pending.state || SYNC.pending.sessions.length)) runSync(); });
+  setInterval(() => { if (syncOn() && (SYNC.pending.state || SYNC.pending.sessions.length) && navigator.onLine !== false) runSync(); }, 60000);
+  if (syncOn() && (SYNC.pending.state || SYNC.pending.sessions.length)) setTimeout(() => runSync(), 1500);
+}
+
+/* ===== sync-ui.js ===== */
+'use strict';
+/* Sync settings screen (bottom sheet) + Plan-tab card */
+function syncCard() {
+  return `<div class="card row" style="padding:12px 14px"><div class="grow"><div class="b">☁ GitHub sync</div><div class="tiny mut" data-sync-status>${esc(syncStatusText())}</div></div>
+  ${syncOn() ? '<button class="btn sm" data-act="syncnow">Sync now</button>' : ''}<button class="btn sm" data-act="syncsettings">${syncOn() ? 'Settings' : 'Set up'}</button></div>`;
+}
+function openSyncSheet(msg) {
+  SHEETCTX = {kind:'sync'};
+  const has = !!SYNC.token;
+  openSheet(`<h2>GitHub sync</h2><p class="small mut" style="margin-top:0">Optional. Backs up your data to your private repo after each session. Without a token the app works exactly as before, on this phone only.</p>
+  <div class="banner ${SYNC.lastError && syncOn() ? 'warn' : 'info'} small" data-sync-status>${esc(syncStatusText())}</div>
+  ${msg ? `<div class="banner ${msg.ok ? 'ok' : 'bad'} small" id="sync-msg">${esc(msg.text)}</div>` : ''}
+  <label class="f">Personal access token</label>
+  <div class="row"><input class="t grow" id="sy-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${has ? 'Saved (ends …' + esc(SYNC.token.slice(-4)) + ') – paste to replace' : 'github_pat_…'}"><button class="btn sm" data-act="synctoggle" aria-label="show or hide token">👁</button></div>
+  <div class="row"><div class="grow"><label class="f">Owner</label><input class="t" id="sy-owner" autocapitalize="off" value="${esc(SYNC.owner)}"></div><div class="grow"><label class="f">Repo</label><input class="t" id="sy-repo" autocapitalize="off" value="${esc(SYNC.repo)}"></div></div>
+  <div class="btns"><button class="btn pri" data-act="syncsave">Save</button><button class="btn" data-act="synctest" ${has ? '' : 'disabled style="opacity:.45"'}>Test connection</button></div>
+  ${has ? `<div class="btns"><button class="btn" data-act="syncnow">Sync now</button><button class="btn" data-act="syncrestore">Restore from GitHub</button></div>
+  <div class="btns"><button class="btn dan" data-act="syncclear">Disconnect &amp; forget token</button></div>` : ''}
+  <details><summary>How to make the token (on your phone)</summary><div class="prose"><ol>
+  <li>On github.com go to <b>Settings › Developer settings › Personal access tokens › Fine-grained tokens › Generate new token</b>.</li>
+  <li>Name it e.g. “IP Method app” and pick an expiry you're happy with.</li>
+  <li><b>Repository access:</b> Only select repositories › <b>ip-method-logs</b>.</li>
+  <li><b>Permissions › Repository permissions › Contents:</b> Read and write.</li>
+  <li>Generate, copy the token, paste it above, tap <b>Save</b>, then <b>Test connection</b>.</li></ol>
+  <p class="tiny mut">The token is stored only in this browser on this phone. It's never written to GitHub or included in Export backups. Writes go to data/state.json, data/sessions/ and data/summary.md.</p></div></details>
+  <div class="btns"><button class="btn" data-act="close">Close</button></div>`);
+}
+const SYNC_ACTIONS = {
+  syncsettings: () => openSyncSheet(),
+  synctoggle: () => { const t = $('#sy-token'); t.type = t.type === 'password' ? 'text' : 'password'; },
+  syncsave: () => {
+    const tok = ($('#sy-token').value || '').trim(), owner = ($('#sy-owner').value || '').trim(), repo = ($('#sy-repo').value || '').trim();
+    if (!owner || !repo) { toast('Enter owner and repo'); return; }
+    if (tok) { SYNC.token = tok; SYNC.lastError = null; }
+    SYNC.owner = owner; SYNC.repo = repo; syncSave();
+    openSyncSheet({ok:true, text:SYNC.token ? 'Saved. Tap Test connection to check it.' : 'Saved (no token yet).'}); render();
+  },
+  synctest: async () => {
+    try { const m = await testConnection(); SYNC.lastError = null; syncSave(); openSyncSheet({ok:true, text:m}); }
+    catch (e) { openSyncSheet({ok:false, text:e.message}); }
+  },
+  syncnow: async () => {
+    if (!syncOn()) { openSyncSheet(); return; }
+    const ok = await runSync(true);
+    if (ok) toast('Synced to GitHub');
+    if (SHEETCTX && SHEETCTX.kind === 'sync') openSyncSheet(ok ? {ok:true, text:'Synced.'} : {ok:false, text:SYNC.lastError ? SYNC.lastError.msg : 'Sync failed'});
+    else render();
+  },
+  syncrestore: async () => {
+    let d;
+    try { d = await fetchRemoteState(); } catch (e) { openSyncSheet({ok:false, text:e.message}); return; }
+    SHEETCTX = {kind:'restore', data:d};
+    openSheet(`<h2>Restore from GitHub</h2><div class="banner warn small">This replaces <b>all</b> data on this phone with the copy on GitHub: ${d.logs.length} logs, ${d.sessions.length} sessions. This phone currently has ${S.logs.length} logs, ${S.sessions.length} sessions.</div>
+    <p class="small mut">Export a local backup first if you might want this phone's data back.</p>
+    <div class="btns"><button class="btn" data-act="export">Export local backup first</button></div>
+    <div class="btns"><button class="btn" data-act="syncsettings">Cancel</button><button class="btn dan" data-act="syncrestoreok">Replace local data</button></div>`);
+  },
+  syncrestoreok: () => {
+    const d = SHEETCTX && SHEETCTX.data; if (!d) return;
+    if (!confirm('Replace ALL data on this phone with the GitHub copy (' + d.logs.length + ' logs)? This cannot be undone.')) return;
+    S = d; save(); closeSheet(); render(); toast('Restored from GitHub');
+  },
+  syncclear: () => {
+    if (!confirm('Disconnect GitHub sync and forget the token on this phone? Your workout data is not affected.')) return;
+    SYNC.token = ''; SYNC.lastError = null; SYNC.pending = {state:false, sessions:[]}; syncSave(); openSyncSheet({ok:true, text:'Disconnected. Token removed from this phone.'}); render();
+  }
+};
 
 /* ===== main.js ===== */
 'use strict';
@@ -828,13 +1038,13 @@ const ACTIONS = {
     const kg = numOrNull($('#st-kg').value); if (!isNum(kg)) { toast('Enter a weight'); return; }
     const id = SHEETCTX.id, lc = LC(S.slots[id].lc); lc.startKg = kg;
     if (S.draft && S.draft.entries[id] && !lcLogs(lc.id).length) S.draft.entries[id] = draftEntry(id);
-    save(); closeSheet(); render(); toast('Start weight saved');
+    save(); closeSheet(); render(); toast('Start weight saved'); syncSoon();
   },
   editslot: v => editSlot(v),
   saveslot: () => {
     const sl = S.slots[SHEETCTX.id], bt = numOrNull($('#es-b').value), tp = numOrNull($('#es-t').value), j = numOrNull($('#es-j').value);
     if (!isNum(bt) || !isNum(tp) || bt >= tp || !isNum(j) || j <= 0) { toast('Check the values'); return; }
-    Object.assign(sl, {bottom:Math.round(bt), top:Math.round(tp), jump:j}); save(); closeSheet(); render();
+    Object.assign(sl, {bottom:Math.round(bt), top:Math.round(tp), jump:j}); save(); closeSheet(); render(); syncSoon();
   },
   editacc: v => editAcc(v),
   saveacc: () => {
@@ -844,12 +1054,13 @@ const ACTIONS = {
   openhist: v => { HSLOT = v; go('history'); },
   hslot: v => { HSLOT = v; render(); },
   treepat: v => { TREEPAT = v; render(); },
-  delses: v => { if (confirm('Delete this session and its logged sets? Closed lifecycles are kept.')) { S.logs = S.logs.filter(l => l.sid !== v); S.sessions = S.sessions.filter(s => s.id !== v); save(); render(); } },
+  delses: v => { if (confirm('Delete this session and its logged sets? Closed lifecycles are kept.')) { S.logs = S.logs.filter(l => l.sid !== v); S.sessions = S.sessions.filter(s => s.id !== v); save(); render(); syncSoon(); } },
   export: () => doExport(),
   import: () => $('#impfile').click(),
   reset: () => { if (confirm('Reset ALL data? This cannot be undone. Export a backup first if you want to keep it.') && confirm('Really delete everything?')) { localStorage.removeItem(KEY); S = freshState(); save(); go('today'); toast('All data cleared'); } },
   close: () => closeSheet()
 };
+Object.assign(ACTIONS, SYNC_ACTIONS);
 document.addEventListener('click', ev => {
   const tab = ev.target.closest('[data-tab]'); if (tab) { go(tab.dataset.tab); return; }
   if (ev.target.closest('#timer')) { stopTimer(); return; }
@@ -870,9 +1081,9 @@ document.addEventListener('change', ev => {
   if (t.id === 'impfile' && t.files[0]) { doImport(t.files[0]); t.value = ''; }
 });
 
-load(); render();
+load(); syncInit(); render();
 // Small read-only hook for automated tests
-window.IP = {get S() { return S; }, evalLc, slotInfo, recommend, lcSummary, best3};
+window.IP = {get S() { return S; }, get SYNC() { return SYNC; }, evalLc, slotInfo, recommend, lcSummary, best3, runSync};
 
 </script>
 </body>
