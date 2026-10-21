@@ -146,6 +146,8 @@ button,[data-act],[data-tab]{cursor:pointer;touch-action:manipulation;-webkit-ta
 .sessbar{display:flex;gap:8px;justify-content:space-between;margin-bottom:12px}
 .sessbar .btn{flex:1}
 button.prow{width:100%;text-align:left;color:var(--tx);font:inherit;align-items:center}
+/* whole button is the touch target: children never become the tap target */
+button *{pointer-events:none}
 
 </style>
 </head>
@@ -1140,11 +1142,14 @@ const ACTIONS = {
   close: () => closeSheet()
 };
 Object.assign(ACTIONS, SYNC_ACTIONS);
+// iOS: the event target can be a text node or a child of the button – always resolve to an Element first
+const evEl = ev => { let el = ev.target; while (el && el.nodeType !== 1) el = el.parentNode; return el || document.body; };
 document.addEventListener('click', ev => {
-  const tab = ev.target.closest('[data-tab]'); if (tab) { go(tab.dataset.tab); return; }
-  if (ev.target.closest('#timer')) { stopTimer(); return; }
-  if (ev.target.id === 'sheet') { closeSheet(); return; }
-  const b = ev.target.closest('[data-act]'); if (!b || b.disabled) return;
+  const tgt = evEl(ev);
+  const tab = tgt.closest('[data-tab]'); if (tab) { go(tab.dataset.tab); return; }
+  if (tgt.closest('#timer')) { stopTimer(); return; }
+  if (tgt.id === 'sheet') { closeSheet(); return; }
+  const b = tgt.closest('[data-act]'); if (!b || b.disabled) return;
   const fn = ACTIONS[b.dataset.act]; if (fn) fn(b.dataset.v, b);
 });
 document.addEventListener('input', ev => {
