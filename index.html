@@ -141,6 +141,12 @@ table.t td{padding:8px 4px;border-bottom:1px solid #1d2638;vertical-align:top}
 .hr{height:1px;background:var(--line);margin:12px 0}
 .calc{background:var(--card2);border-radius:12px;padding:10px 12px;margin-top:8px}
 
+/* tap reliability on iOS */
+button,[data-act],[data-tab]{cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:rgba(34,211,166,.15)}
+.sessbar{display:flex;gap:8px;justify-content:space-between;margin-bottom:12px}
+.sessbar .btn{flex:1}
+button.prow{width:100%;text-align:left;color:var(--tx);font:inherit;align-items:center}
+
 </style>
 </head>
 <body>
@@ -343,20 +349,21 @@ function vToday() {
     h += `<div class="daypick">${['A','B','C'].map(d => `<button data-act="startday" data-v="${d}" class="${d === sug ? 'sug' : ''}"><div class="d">${d}</div><div class="s">${DAYNAME[d]}</div>${d === sug ? '<div class="s" style="color:var(--acc);font-weight:800;margin-top:4px">NEXT UP</div>' : ''}</button>`).join('')}</div>`;
     const last = [...S.sessions].sort(byDate).pop();
     h += `<p class="mut small" style="text-align:center;margin-top:12px">${last ? `Last session: Day ${last.day}, ${fmtD(last.date)}. ` : ''}Rotation: A → B → C → A (e.g. Mon / Wed / Fri).</p>`;
-    h += `<h3>Day ${sug} preview</h3>` + DAYS[sug].map(previewRow).join('');
+    h += `<h3>Day ${sug} preview <span class="tiny mut" style="font-weight:600">– tap a lift to start</span></h3>` + DAYS[sug].map(previewRow).join('');
     return h;
   }
   const dr = S.draft;
   setHeader('Day ' + dr.day + ' · ' + DAYNAME[dr.day], fmtD(dr.date));
-  let h = `<label class="f" style="margin-top:0">Session date (change it to log a past session)</label><input class="t" type="date" data-draft="date" value="${dr.date}" style="margin-bottom:12px">`;
+  let h = `<div class="sessbar"><button class="btn sm" data-act="switchday">⇄ Switch day</button><button class="btn sm dan" data-act="discardask">✕ Cancel session</button></div>`;
+  h += `<label class="f" style="margin-top:0">Session date (change it to log a past session)</label><input class="t" type="date" data-draft="date" value="${dr.date}" style="margin-bottom:12px">`;
   h += DAYS[dr.day].map(id => isAcc(id) ? accCard(id) : liftCard(id)).join('');
-  h += `<div class="btns"><button class="btn dan" data-act="discard">Discard</button><button class="btn pri" data-act="finish">Finish &amp; save</button></div>`;
+  h += `<div class="btns"><button class="btn dan" data-act="discardask">Cancel session</button><button class="btn pri" data-act="finish">Finish &amp; save</button></div>`;
   return h;
 }
 function previewRow(id) {
   const i = slotInfo(id);
   const t = i.acc ? (isNum(i.target) ? kgf(i.target) + ' kg' : 'set weight') : (isNum(i.target) ? kgf(i.target) + ' kg' : (i.rotate ? 'rotate' : 'set start kg'));
-  return `<div class="card row" style="padding:11px 13px"><span class="slot ${slotCls(id)}">${id}</span><div class="grow"><div class="b" style="font-size:15px">${esc(i.sl.ex)}</div><div class="tiny mut">${esc(i.def.pattern)} · ${i.sl.bottom}–${i.sl.top} reps</div></div><div style="text-align:right"><div class="b">${t}</div><span class="st ${stCls(i.status)}">${stLabel(i.status)}</span></div></div>`;
+  return `<button class="card row prow" data-act="previewgo" data-v="${id}" style="padding:11px 13px"><span class="slot ${slotCls(id)}">${id}</span><div class="grow"><div class="b" style="font-size:15px">${esc(i.sl.ex)}</div><div class="tiny mut">${esc(i.def.pattern)} · ${i.sl.bottom}–${i.sl.top} reps</div></div><div style="text-align:right"><div class="b">${t}</div><span class="st ${stCls(i.status)}">${stLabel(i.status)}</span></div><span class="mut" style="font-size:20px;padding-left:4px">›</span></button>`;
 }
 function numBox(path, val, ph, step, unit) {
   return `<div class="num"><button data-act="step" data-p="${path}" data-d="-${step}" aria-label="minus">−</button><input inputmode="decimal" type="number" step="any" data-draft="${path}" value="${val == null ? '' : val}" placeholder="${ph == null ? '' : ph}">${unit ? `<span class="u">${unit}</span>` : ''}<button data-act="step" data-p="${path}" data-d="${step}" aria-label="plus">+</button></div>`;
@@ -402,9 +409,37 @@ function draftEntry(id) {
   const bo = i.pull || !isNum(i.target) ? null : i.backoff;
   return {kg:isNum(i.target) ? i.target : null, reps:null, bo:[[bo, null], [bo, null]], done:[false, false, false], note:''};
 }
+/* Parked drafts: when you switch day mid-session, the sets you'd entered are parked under their own key
+   (the main data key/format is untouched) and come back if you return to that day on the same date. */
+const PARK_KEY = 'ipMethodJosh.parked.v1';
+function parkedGet() { try { return JSON.parse(localStorage.getItem(PARK_KEY)) || {}; } catch (e) { return {}; } }
+function parkedSet(o) { try { Object.keys(o).length ? localStorage.setItem(PARK_KEY, JSON.stringify(o)) : localStorage.removeItem(PARK_KEY); } catch (e) { /* ignore */ } }
+function parkDraft() {
+  if (!S.draft) return;
+  const o = parkedGet(); o[S.draft.day] = S.draft; parkedSet(o);
+}
 function startDay(d) {
-  const entries = {}; DAYS[d].forEach(id => entries[id] = draftEntry(id));
-  S.draft = {day:d, date:todayISO(), entries}; save(); render(); window.scrollTo(0, 0);
+  const o = parkedGet(), pk = o[d]; delete o[d]; parkedSet(o);
+  const entries = {}; DAYS[d].forEach(id => entries[id] = (pk && pk.entries && pk.entries[id]) || draftEntry(id));
+  S.draft = {day:d, date:(pk && pk.date) || todayISO(), entries}; save(); render(); window.scrollTo(0, 0);
+  if (pk) toast('Day ' + d + ': your entered sets are back');
+}
+function switchSheet() {
+  const cur = S.draft && S.draft.day, pk = parkedGet();
+  openSheet(`<h2>Switch day</h2><p class="small mut" style="margin-top:0">Sets you've entered for Day ${cur} are kept on this phone and come back if you switch back.</p>
+  <div class="daypick">${['A','B','C'].map(d => `<button data-act="switchto" data-v="${d}" class="${d === cur ? 'sug' : ''}"><div class="d">${d}</div><div class="s">${DAYNAME[d]}</div>${d === cur ? '<div class="s" style="color:var(--acc);font-weight:800;margin-top:4px">CURRENT</div>' : pk[d] ? '<div class="s" style="color:var(--warn);font-weight:800;margin-top:4px">IN PROGRESS</div>' : ''}</button>`).join('')}</div>
+  <div class="btns"><button class="btn" data-act="close">Back to Day ${cur}</button><button class="btn dan" data-act="discardask">Cancel session</button></div>`);
+}
+function discardSheet() {
+  openSheet(`<h2>Cancel Day ${S.draft.day} session?</h2><p class="small">Nothing from this session will be saved. Your logged history and start weights are not affected.</p>
+  <div class="btns"><button class="btn" data-act="close">Keep going</button><button class="btn dan" data-act="discardok">Cancel session</button></div>`);
+}
+function previewGo(id) {
+  const d = SLOTDEF[id].day;
+  if (!S.draft) startDay(d); else if (S.draft.day !== d) { parkDraft(); startDay(d); }
+  const i = slotInfo(id);
+  if (!isAcc(id) && !isNum(i.target) && !i.rotate) { startSheet(id); return; }
+  const c = document.getElementById('card-' + id); if (c) c.scrollIntoView({block:'start'});
 }
 function fieldRef(path) {
   const [id, f] = path.split('.'); const e = S.draft.entries[id]; let m;
@@ -1037,6 +1072,11 @@ const ACTIONS = {
   startday: v => startDay(v),
   discard: () => { if (confirm('Discard this session? Nothing will be saved.')) { S.draft = null; save(); render(); } },
   finish: () => finishSession(),
+  discardask: () => { if (S.draft) discardSheet(); },
+  discardok: () => { if (S.draft) { const o = parkedGet(); delete o[S.draft.day]; parkedSet(o); S.draft = null; save(); } closeSheet(); render(); window.scrollTo(0, 0); toast('Session cancelled'); },
+  switchday: () => { if (S.draft) switchSheet(); },
+  switchto: v => { closeSheet(); if (S.draft && S.draft.day === v) return; parkDraft(); startDay(v); },
+  previewgo: v => previewGo(v),
   step: (v, b) => {
     const p = b.dataset.p, inp = b.parentElement.querySelector('input');
     let base = draftGet(p); if (!isNum(base)) base = numOrNull(inp.placeholder); if (!isNum(base)) base = 0;
