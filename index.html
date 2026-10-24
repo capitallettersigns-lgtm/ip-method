@@ -151,6 +151,7 @@ button.prow{width:100%;text-align:left;color:var(--tx);font:inherit;align-items:
 button *{pointer-events:none}
 
 .tgt .plates{color:var(--acc);font-weight:600;margin:1px 0 2px}
+.why{margin:8px 0 2px;padding:7px 10px;border-radius:10px;background:var(--card2);color:var(--mut);line-height:1.35}.why b{color:var(--tx)}
 
 </style>
 </head>
@@ -279,11 +280,66 @@ function evalLc(lcId) {
     else if (wk > 1 && prev && prev.reps - l.reps >= 2) status = 'WATCH - reps fell 2+';
     else if (wk === 1) status = 'START';
     else status = 'PROGRESSING';
-    let next = status.startsWith('ROTATE') ? null : barMin(ex, r2(l.kg + jumpFor(ex, jump)));
-    if (next != null && isAssisted(ex)) next = Math.min(0, next);   // no assistance (0) is the upper limit
-    out.push({log:l, wk, e1:e1rm(l.kg, l.reps), flag, status, next, nextBo: next == null ? null : backOff(ex, next)});
+    const p = status.startsWith('ROTATE') ? {next:null, why:''} : planTop(ex, l, jump, top);
+    out.push({log:l, wk, e1:e1rm(l.kg, l.reps), flag, status, next:p.next, why:p.why, recal:!!p.recal, nextBo: p.next == null ? null : backOff(ex, p.next)});
   });
   return out;
+}
+
+/* ---- Performance-based targets (IP Method) ----
+   Top set: last + jump. If last week's top set went OVER the top of the range the start was too light:
+   recalibrate from its Brzycki e1RM to the weight predicted for top-of-range reps (rounded down to plates),
+   never below last + jump. Rotate cases never get here (handled by the rotate flow). */
+const setTxt = (kg, reps) => kgf(kg) + '×' + (isNum(reps) ? reps : '?');
+function planTop(ex, l, jump, top) {
+  const j = jumpFor(ex, jump), plus = barMin(ex, r2(l.kg + j));
+  if (isAssisted(ex)) return {next:Math.min(0, plus), why:`Last week ${setTxt(l.kg, l.reps)} → ${kgf(Math.abs(j))} kg less assistance${plus >= 0 ? ' (capped at 0 = bodyweight)' : ''}`};
+  if (isNum(l.reps) && l.reps > top && !isPullUp(ex)) {
+    const e = e1rm(l.kg, l.reps), raw = isNum(e) ? startFromE1(e, top) : null;
+    const cand = !isNum(raw) ? null : isBarbell(ex) ? barFloor(raw) : raw;
+    if (isNum(cand) && cand > plus) return {next:cand, recal:true, why:`Last week ${setTxt(l.kg, l.reps)} – over the ${top}-rep top, too easy, so recalibrated to ${kgf(cand)} (e1RM ${kgf(e)})`};
+    return {next:plus, recal:true, why:`Last week ${setTxt(l.kg, l.reps)} – over the ${top}-rep top; e1RM ${kgf(e)} says ${kgf(cand)}, so +${kgf(j)} (never less than last + jump)`};
+  }
+  return {next:plus, why:`+${kgf(j)} from last week (${setTxt(l.kg, l.reps)})`};
+}
+/* Back-offs: ~80% of the planned top set (rounded down to plates for barbell), nudged by last week's back-offs:
+   average reps ≥ top+3 → one increment above the heavier of (80%, last week's back-off kg); any set below the bottom
+   → one increment below the lighter; otherwise never lighter than last week's back-off kg. Capped at the top set. */
+function planBo(id, topKg, lastLog) {
+  const sl = S.slots[id], lc = LC(sl.lc), ex = lc.ex || sl.ex;
+  if (!isNum(topKg) || (isPullUp(ex) && !isAssisted(ex))) return {kg:null, why:''};
+  const bar = isBarbell(ex), inc = bar ? BAR_STEP : Math.abs(jumpFor(ex, sl.jump)) || 1.25;
+  const bos = lastLog && Array.isArray(lastLog.bo) ? lastLog.bo.filter(b => b && isNum(b[0]) && isNum(b[1])) : [];
+  const reps = bos.map(b => b[1]), kgs = bos.map(b => b[0]), avg = reps.length ? reps.reduce((a, b) => a + b, 0) / reps.length : null;
+  const hi = reps.length && avg >= sl.top + 3, lo = reps.length && Math.min(...reps) < sl.bottom;
+  const rnd = x => bar ? barFloor(x) : isAssisted(ex) ? Math.floor(x / 1.25 + 1e-9) * 1.25 : r2(x);
+  let kg, why;
+  if (isAssisted(ex)) {            // negative loads: back-off = same or more assistance than the top set
+    const base = kgs.length ? Math.min(...kgs) + inc : topKg;
+    kg = hi ? base + inc : lo ? base - inc : base;
+    why = kgs.length ? `Last week's back-offs ${bos.map(b => setTxt(b[0], b[1])).join(', ')} → ${hi ? 'well above the range, ' + kgf(2 * inc) + ' kg less assistance' : lo ? 'below the range, same assistance' : kgf(inc) + ' kg less assistance'}` : 'Same assistance as the top set';
+    kg = Math.min(0, topKg, r2(kg));
+    return {kg, why};
+  }
+  const base = backOff(ex, topKg), pct = `~80% of ${kgf(topKg)} = ${kgf(base)}`;
+  if (hi) { kg = rnd(Math.max(base, ...kgs) + inc); why = `${pct}; last week's back-offs ${reps.join('/')} reps – well above ${sl.top}, so +${kgf(inc)}`; }
+  else if (lo) { kg = rnd(Math.min(base, ...kgs) - inc); why = `${pct}; last week's back-offs fell below ${sl.bottom} reps, so −${kgf(inc)}`; }
+  else if (kgs.length && Math.max(...kgs) > base) { kg = rnd(Math.max(...kgs)); why = `Same as last week's back-offs (${bos.map(b => setTxt(b[0], b[1])).join(', ')}) – more than ${pct}`; }
+  else { kg = base; why = reps.length ? `${pct}; last week's back-offs ${reps.join('/')} reps – in range` : pct + (bar ? ' (rounded down)' : ''); }
+  kg = Math.min(kg, topKg); kg = bar ? Math.max(BAR_KG, kg) : Math.max(0, kg);
+  if (kg === topKg && kg !== base && !lo) why += ` (capped at the top set)`;
+  if (bar && kg === BAR_KG && base === BAR_KG && !hi) why += ' (empty bar minimum)';
+  return {kg, why};
+}
+/* Accessories: double progression, per set. Every set at the top of the range → + increment; otherwise same kg, more reps. */
+function planAcc(id) {
+  const sl = S.slots[id], logs = S.logs.filter(l => l.slot === id && l.sets).sort(byDate), last = logs[logs.length - 1];
+  if (!last) return {sets:isNum(sl.kg) ? [sl.kg, sl.kg] : [null, null], why:'', up:false};
+  const ss = last.sets.filter(s => isNum(s[1]));
+  const up = ss.length > 0 && ss.every(s => s[1] >= sl.top);
+  const kgs = [0, 1].map(k => { const s = last.sets[k] || last.sets[0], w = s && isNum(s[0]) ? s[0] : sl.kg; return isNum(w) ? (up ? r2(w + sl.inc) : w) : null; });
+  const lt = last.sets.map(s => setTxt(s[0], s[1])).join(', ');
+  return {sets:kgs, up, why: up ? `Last time ${lt} – every set hit ${sl.top}, so +${kgf(sl.inc)} kg` : `Last time ${lt} – same weight, beat those reps until every set hits ${sl.top}`};
 }
 
 function slotInfo(id) {
@@ -293,13 +349,15 @@ function slotInfo(id) {
     const last = logs[logs.length - 1];
     let status = 'NEW';
     if (last && last.sets) status = last.sets.every(s => isNum(s[1]) && s[1] >= sl.top) ? 'ADD WEIGHT' : 'BUILD REPS';
-    return {sl, def, logs, last, status, target:sl.kg, acc:true};
+    const pa = planAcc(id);
+    return {sl, def, logs, last, status, target:sl.kg, acc:true, sets:pa.sets, why:pa.why};
   }
   const lc = LC(sl.lc); const ev = evalLc(sl.lc); const last = ev[ev.length - 1];
   const status = last ? last.status : 'NEW';
   const ex = lc.ex || sl.ex, target = last ? last.next : barMin(ex, lc.startKg);
-  return {sl, def, lc, ev, last, status, rotate:status.startsWith('ROTATE'), target, wk:ev.length + 1,
-    backoff: isNum(target) ? backOff(ex, target) : null, pull:isPullUp(sl.ex), assist:isAssisted(ex), barbell:isBarbell(ex)};
+  const bp = planBo(id, target, last && last.log);
+  return {sl, def, lc, ev, last, status, rotate:status.startsWith('ROTATE'), target, wk:ev.length + 1, why:last ? last.why : (isNum(target) ? 'Week 1 start weight' : ''),
+    backoff:bp.kg, boWhy:bp.why, pull:isPullUp(sl.ex), assist:isAssisted(ex), barbell:isBarbell(ex)};
 }
 const stCls = s => s.startsWith('ROTATE') ? 'ROTATE' : s.startsWith('WATCH') ? 'WATCH' : s === 'ADD WEIGHT' ? 'ADD' : (s === 'NEW' || s === 'BUILD REPS') ? 'NEW' : s;
 const stLabel = s => s === 'NEW' ? 'NOT STARTED' : s.replace(' - ', ' · ');
@@ -414,15 +472,17 @@ function liftCard(id) {
   if (i.rotate) return h + `<div class="banner bad"><b>${esc(stLabel(i.status))}.</b> This lifecycle is over. Diagnose the last top set, then choose the next exercise.</div><div class="btns"><button class="btn rotbtn" data-act="rotate" data-v="${id}">Why did it fail? →</button></div></div>`;
   if (!isNum(i.target)) return h + `<div class="banner info">Set a starting top-set weight (aim for the top of the ${sl.bottom}–${sl.top} range).</div><div class="btns"><button class="btn pri" data-act="setstart" data-v="${id}">Set start weight</button></div></div>`;
   const lastReps = i.last ? i.last.log.reps : null;
-  const repTxt = i.wk === 1 ? `aim ${sl.top}` : `fight for ${lastReps}+`;
+  const bp = boLive(id, e.kg);   // back-off follows today's actual top set once it's entered
+  const repTxt = i.wk === 1 || (i.last && lastReps > sl.top) ? `aim ${sl.top}` : `fight for ${lastReps}+`;
   h += `<div class="targets"><div class="tgt"><div class="l">Top set</div><div class="v">${kgf(i.target)}<small> ${i.assist ? 'kg assist' : i.pull ? 'kg added' : 'kg'}</small></div>${i.barbell ? `<div class="tiny plates">${esc(plateTxt(i.target))}</div>` : ''}<div class="tiny mut">${sl.bottom}–${sl.top} reps · ${repTxt}${i.last ? ` · last ${kgf(i.last.log.kg)}×${lastReps}` : ''}</div></div>
-  <div class="tgt"><div class="l">Back-off ×2</div>${i.assist ? `<div class="v" style="font-size:15px;padding-top:4px">Same or more assist</div><div class="tiny mut">strict, to failure</div>` : i.pull ? `<div class="v" style="font-size:15px;padding-top:4px">Bodyweight / lighter belt</div><div class="tiny mut">strict, to failure</div>` : `<div class="v">${kgf(i.backoff)}<small> kg</small></div>${i.barbell ? `<div class="tiny plates">${esc(plateTxt(i.backoff))}</div>` : ''}<div class="tiny mut">~80%${i.barbell ? ' (rounded down)' : ''}, strict, to failure</div>`}</div></div>
+  <div class="tgt"><div class="l">Back-off ×2</div>${i.assist ? `<div class="v" id="bov-${id}">${kgf(bp.kg)}<small> kg assist</small></div><div class="tiny mut">same or more assist, strict, to failure</div>` : i.pull ? `<div class="v" style="font-size:15px;padding-top:4px">Bodyweight / lighter belt</div><div class="tiny mut">strict, to failure</div>` : `<div class="v" id="bov-${id}">${kgf(bp.kg)}<small> kg</small></div>${i.barbell ? `<div class="tiny plates" id="bop-${id}">${esc(plateTxt(bp.kg))}</div>` : ''}<div class="tiny mut">~80%${i.barbell ? ' (rounded down)' : ''}, strict, to failure</div>`}</div></div>
+  <div class="why small"><div>↑ <b>Top:</b> ${esc(i.why)}</div>${bp.why ? `<div id="bow-${id}">↳ <b>Back-offs:</b> ${esc(bp.why)}</div>` : ''}</div>
   <div class="row small mut wrap" style="gap:8px"><span class="pill">⏱ ${esc(def.rest)}</span><span class="pill">${i.assist ? kgf(sl.jump) + ' kg less assist / week' : '+' + kgf(jumpFor(i.lc.ex || sl.ex, sl.jump)) + ' kg / week'}</span></div>`;
   if (i.assist) h += `<div class="banner info small">Assisted: enter the assistance as a <b>negative</b> kg (−30 = 30 kg of help). 0 = bodyweight, the most it goes to.${i.target === 0 ? ' <b>You’re at bodyweight:</b> once you hit the bottom of the range here, rotate to Weighted pronated pull-ups.' : ''}</div>`;
   const u = i.assist ? 'kg' : i.pull ? '+kg' : 'kg';
   h += `<div class="sethead"><span></span><span>${i.assist ? 'ASSIST KG' : i.pull ? 'ADDED KG' : 'KG'}</span><span>REPS</span><span>DONE</span></div><div class="set"><div class="lab">TOP<br><span class="mut" style="font-weight:600">set</span></div>${numBox(id + '.kg', e.kg, kgf(i.target), i.barbell ? BAR_STEP : sl.jump, u, i.assist)}${numBox(id + '.reps', e.reps, sl.top, 1, 'reps')}${chk(id + '.d0', e.done[0])}</div>`;
   [0, 1].forEach(k => {
-    h += `<div class="set"><div class="lab">BACK<br><span class="mut" style="font-weight:600">off ${k + 1}</span></div>${numBox(id + '.bo' + k + 'kg', e.bo[k][0], i.assist ? kgf(i.target) : i.pull ? '0' : kgf(i.backoff), i.assist || i.barbell ? 2.5 : 1.25, u, i.assist)}${numBox(id + '.bo' + k + 'reps', e.bo[k][1], '', 1, 'reps')}${chk(id + '.d' + (k + 1), e.done[k + 1])}</div>`;
+    h += `<div class="set"><div class="lab">BACK<br><span class="mut" style="font-weight:600">off ${k + 1}</span></div>${numBox(id + '.bo' + k + 'kg', e.bo[k][0], i.pull && !i.assist ? '0' : kgf(bp.kg), i.assist || i.barbell ? 2.5 : 1.25, u, i.assist)}${numBox(id + '.bo' + k + 'reps', e.bo[k][1], '', 1, 'reps')}${chk(id + '.d' + (k + 1), e.done[k + 1])}</div>`;
   });
   const key = def.type === 'Key movement';
   h += `<div class="row" style="margin-top:10px;gap:8px"><button class="btn sm" data-act="timer" data-v="${key ? 210 : 150}">Rest ${key ? '3:30' : '2:30'}</button><button class="btn sm" data-act="timer" data-v="150">Rest 2:30</button><div class="grow"></div><button class="link" data-act="openhist" data-v="${id}">History</button></div>
@@ -432,19 +492,38 @@ function liftCard(id) {
 }
 function accCard(id) {
   const i = slotInfo(id), e = S.draft.entries[id], sl = i.sl, def = i.def, tgt = i.target;
-  const msg = i.status === 'ADD WEIGHT' ? `Both sets hit ${sl.top} last time → +${kgf(sl.inc)} kg today.` : i.status === 'BUILD REPS' ? `Same weight; add reps until both sets reach ${sl.top}.` : '';
+  const msg = i.why;
   let h = `<div class="card" id="card-${id}"><div class="row"><span class="slot a">${id}</span><span class="badge">Accessory</span><span class="st ${stCls(i.status)}">${stLabel(i.status)}</span></div>
   <div class="exname" style="margin-top:8px">${esc(sl.ex)}</div><div class="small mut">${esc(def.pattern)} · ${esc(def.sets)} · ${esc(def.rest)}</div>`;
-  h += isNum(tgt) ? `<div class="small mut" style="margin-top:6px">${msg || 'Double progression.'}</div>` : `<div class="banner info">Enter the weight you use; the app remembers it and handles double progression.</div>`;
+  h += isNum(tgt) || isNum(i.sets[0]) ? `<div class="why small">${esc(msg || 'Double progression.')}</div>` : `<div class="banner info">Enter the weight you use; the app remembers it and handles double progression.</div>`;
   h += `<div class="sethead"><span></span><span>KG</span><span>REPS</span><span>DONE</span></div>`;
-  [0, 1].forEach(k => { h += `<div class="set"><div class="lab">SET ${k + 1}</div>${numBox(id + '.s' + k + 'kg', e.sets[k][0], isNum(tgt) ? kgf(tgt) : 'kg', sl.inc, 'kg')}${numBox(id + '.s' + k + 'reps', e.sets[k][1], sl.top, 1, 'reps')}${chk(id + '.d' + k, e.done[k])}</div>`; });
+  [0, 1].forEach(k => { h += `<div class="set"><div class="lab">SET ${k + 1}</div>${numBox(id + '.s' + k + 'kg', e.sets[k][0], isNum(i.sets[k]) ? kgf(i.sets[k]) : isNum(tgt) ? kgf(tgt) : 'kg', sl.inc, 'kg')}${numBox(id + '.s' + k + 'reps', e.sets[k][1], sl.top, 1, 'reps')}${chk(id + '.d' + k, e.done[k])}</div>`; });
   return h + `<div class="row" style="margin-top:10px"><button class="btn sm" data-act="timer" data-v="105">Rest 1:45</button><div class="grow"></div><button class="link" data-act="openhist" data-v="${id}">History</button></div></div>`;
 }
 
+/* Back-off suggestion for a given top-set kg (null = the planned top set). */
+function boLive(id, topKg) {
+  const i = slotInfo(id); return planBo(id, isNum(topKg) ? topKg : i.target, i.last && i.last.log);
+}
+/* Top-set kg changed in the session: re-derive back-offs that are still empty or still at the previous suggestion.
+   Anything he typed himself is never overwritten. */
+function topChanged(id, prevKg, newKg) {
+  if (!S.draft || !S.draft.entries[id] || isAcc(id)) return;
+  const e = S.draft.entries[id], was = boLive(id, prevKg).kg, now = boLive(id, newKg);
+  if (!isNum(now.kg) || was === now.kg) return;
+  let changed = false;
+  e.bo.forEach((b, k) => { if (b[0] == null || b[0] === was) { b[0] = now.kg; changed = true;
+    const inp = document.querySelector(`[data-draft="${id}.bo${k}kg"]`); if (inp) inp.value = now.kg; } });
+  document.querySelectorAll(`[data-draft^="${id}.bo"][data-draft$="kg"]`).forEach(inp => inp.placeholder = kgf(now.kg));
+  const v = document.getElementById('bov-' + id); if (v) v.firstChild.nodeValue = kgf(now.kg);
+  const pl = document.getElementById('bop-' + id); if (pl) pl.textContent = plateTxt(now.kg);
+  const w = document.getElementById('bow-' + id); if (w) w.innerHTML = `↳ <b>Back-offs:</b> ${esc(isNum(newKg) && newKg !== slotInfo(id).target ? 'From today\'s actual top set ' + kgf(newKg) + ': ' + now.why : now.why)}`;
+  if (changed) save();
+}
 function draftEntry(id) {
   const i = slotInfo(id);
-  if (isAcc(id)) { const w = isNum(i.target) ? (i.status === 'ADD WEIGHT' ? r2(i.target + i.sl.inc) : i.target) : null; return {sets:[[w, null], [w, null]], done:[false, false]}; }
-  const bo = i.pull || !isNum(i.target) ? null : i.backoff;
+  if (isAcc(id)) return {sets:[[i.sets[0], null], [i.sets[1], null]], done:[false, false]};   // suggestions pre-filled; he only adjusts
+  const bo = !isNum(i.target) ? null : i.backoff;
   return {kg:isNum(i.target) ? i.target : null, reps:null, bo:[[bo, null], [bo, null]], done:[false, false, false], note:''};
 }
 /* Parked drafts: when you switch day mid-session, the sets you'd entered are parked under their own key
@@ -522,7 +601,7 @@ function showSummary(ids) {
     const sub = i.acc ? '' : `${i.last ? `${kgf(i.last.log.kg)}×${i.last.log.reps} · e1RM ${kgf(i.last.e1)}` : ''}${i.rotate ? '' : ` · next ${kgf(i.target)} kg`}`;
     return `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)"><span class="slot ${slotCls(id)}">${id}</span><div class="grow small"><div class="b">${esc(i.sl.ex)}</div><div class="mut tiny">${sub}</div></div><div style="text-align:right"><span class="st ${stCls(i.status)}">${stLabel(i.status)}</span>${i.rotate ? `<div><button class="link" data-act="rotate" data-v="${id}">Why did it fail? →</button></div>` : ''}</div></div>`;
   }).join('');
-  openSheet(`<h2>Session saved 💪</h2><p class="mut small">Next week's targets are set: each top set goes up by its fixed jump, whatever you feel like.</p>${rows}<div class="btns"><button class="btn pri" data-act="close">Done</button></div>`);
+  openSheet(`<h2>Session saved 💪</h2><p class="mut small">Next week's targets are set from how today went (top set + jump, recalibrated if you beat the rep range; back-offs and accessories adjusted to your reps). They're pre-filled next time – just adjust.</p>${rows}<div class="btns"><button class="btn pri" data-act="close">Done</button></div>`);
 }
 
 /* ===== views-rotate.js ===== */
@@ -1120,7 +1199,8 @@ const ACTIONS = {
     const p = b.dataset.p, inp = b.parentElement.querySelector('input');
     let base = draftGet(p); if (!isNum(base)) base = numOrNull(inp.placeholder); if (!isNum(base)) base = 0;
     const sid = p.split('.')[0], neg = SLOTDEF[sid] && !isAcc(sid) && isAssisted(S.slots[sid].ex);
-    const nv = neg ? Math.min(0, r2(base + parseFloat(b.dataset.d))) : Math.max(0, r2(base + parseFloat(b.dataset.d))); inp.value = nv; draftSet(p, String(nv));
+    const nv = neg ? Math.min(0, r2(base + parseFloat(b.dataset.d))) : Math.max(0, r2(base + parseFloat(b.dataset.d))); const prev = draftGet(p); inp.value = nv; draftSet(p, String(nv));
+    if (/^[A-C]\d\.kg$/.test(p)) topChanged(sid, prev, nv);
   },
   tick: (v, b) => {
     const [id, f] = b.dataset.p.split('.'), k = +f.slice(1), e = S.draft.entries[id];
@@ -1193,7 +1273,8 @@ document.addEventListener('click', ev => {
 });
 document.addEventListener('input', ev => {
   const t = ev.target;
-  if (t.dataset && t.dataset.draft && t.dataset.draft !== 'date' && S.draft) draftSet(t.dataset.draft, t.value);
+  if (t.dataset && t.dataset.draft && t.dataset.draft !== 'date' && S.draft) { const p = t.dataset.draft, prev = /^[A-C]\d\.kg$/.test(p) ? draftGet(p) : undefined; draftSet(p, t.value);
+    if (prev !== undefined) topChanged(p.split('.')[0], prev, draftGet(p)); }
   if (t.id === 'am-kg' || t.id === 'am-reps') amrapCalc();
   if (t.id === 'treeq') { TREEQ = t.value; $('#treelist').innerHTML = treeList(filteredTree()); }
 });
