@@ -287,20 +287,36 @@ function evalLc(lcId) {
 }
 
 /* ---- Performance-based targets (IP Method) ----
-   Top set: last + jump. If last week's top set went OVER the top of the range the start was too light:
-   recalibrate from its Brzycki e1RM to the weight predicted for top-of-range reps (rounded down to plates),
-   never below last + jump. Rotate cases never get here (handled by the rotate flow). */
+   Top set = the higher of (a) last week's top set + jump and (b) the weight predicted for top-of-range reps from the
+   BEST Brzycki e1RM across all of last week's sets (top set + both back-offs; >36 reps counts as at least weight + increment),
+   rounded down to plates. Assisted: the most effective set (least assistance at/over the top of the range), capped at 0.
+   Rotate cases never get here (handled by the rotate flow). */
 const setTxt = (kg, reps) => kgf(kg) + '×' + (isNum(reps) ? reps : '?');
 function planTop(ex, l, jump, top) {
-  const j = jumpFor(ex, jump), plus = barMin(ex, r2(l.kg + j));
-  if (isAssisted(ex)) return {next:Math.min(0, plus), why:`Last week ${setTxt(l.kg, l.reps)} → ${kgf(Math.abs(j))} kg less assistance${plus >= 0 ? ' (capped at 0 = bodyweight)' : ''}`};
-  if (isNum(l.reps) && l.reps > top && !isPullUp(ex)) {
-    const e = e1rm(l.kg, l.reps), raw = isNum(e) ? startFromE1(e, top) : null;
-    const cand = !isNum(raw) ? null : isBarbell(ex) ? barFloor(raw) : raw;
-    if (isNum(cand) && cand > plus) return {next:cand, recal:true, why:`Last week ${setTxt(l.kg, l.reps)} – over the ${top}-rep top, too easy, so recalibrated to ${kgf(cand)} (e1RM ${kgf(e)})`};
-    return {next:plus, recal:true, why:`Last week ${setTxt(l.kg, l.reps)} – over the ${top}-rep top; e1RM ${kgf(e)} says ${kgf(cand)}, so +${kgf(j)} (never less than last + jump)`};
+  const j = jumpFor(ex, jump), plus = barMin(ex, r2(l.kg + j)), bar = isBarbell(ex), asst = isAssisted(ex);
+  // every set from last week: top set + both back-offs, taken at face value
+  const sets = [['top set', l.kg, l.reps]].concat((Array.isArray(l.bo) ? l.bo : []).map((b, k) => ['back-off ' + (k + 1), b && b[0], b && b[1]]))
+    .filter(x => isNum(x[1]) && isNum(x[2]) && x[2] > 0);
+  let best = null;
+  sets.forEach(([lab, w, r]) => {
+    let cand, e = null;
+    if (asst) cand = r > top + 2 ? w + 2 * Math.abs(j) : r >= top ? w + Math.abs(j) : null;   // no e1RM for assistance: most effective set wins
+    else if (isPullUp(ex)) cand = null;                                                    // weighted pull-up: added-load e1RM is meaningless
+    else if (r >= 37) cand = bar ? barRound(w + j) : r2(w + j);                            // Brzycki undefined: at least weight + increment
+    else { e = e1rm(w, r); cand = startFromE1(e, top); if (bar) cand = barFloor(cand); }
+    if (isNum(cand) && (!best || cand > best.cand)) best = {lab, w, r, e, cand};
+  });
+  if (asst) {
+    const nx = Math.min(0, best && best.cand > plus ? r2(best.cand) : plus), via = best && best.cand > plus;
+    return {next:nx, recal:via, why: via ? `Best set last week: ${best.lab} ${setTxt(best.w, best.r)} (well past ${top} reps), so top set ${kgf(nx)}${nx === 0 ? ' (0 = bodyweight, the cap)' : ''}`
+      : `Last week ${setTxt(l.kg, l.reps)} → ${kgf(Math.abs(j))} kg less assistance${plus >= 0 ? ' (capped at 0 = bodyweight)' : ''}`};
   }
-  return {next:plus, why:`+${kgf(j)} from last week (${setTxt(l.kg, l.reps)})`};
+  if (best && best.cand > plus) {
+    const how = isNum(best.e) ? `e1RM ${kgf(best.e)}` : `over 36 reps, so at least +${kgf(j)}`;
+    return {next:best.cand, recal:true, why:`Best set last week: ${best.lab} ${setTxt(best.w, best.r)}, ${how}, so top set ${kgf(best.cand)} for ~${top} reps`};
+  }
+  const bx = best && isNum(best.e) ? `; best set (${best.lab} ${setTxt(best.w, best.r)}, e1RM ${kgf(best.e)}) predicts only ${kgf(best.cand)}` : '';
+  return {next:plus, why:`+${kgf(j)} from last week (${setTxt(l.kg, l.reps)})${bx}`};
 }
 /* Back-offs: every set progresses from ITS OWN last-week weight and reps (logs taken at face value – no caps):
    reps ≥ top+3 → +1 increment, or more if that set's e1RM says so (weight for top-of-range reps, rounded down to plates);
@@ -477,7 +493,7 @@ function liftCard(id) {
   const bp = boLive(id, e.kg);   // back-off follows today's actual top set once it's entered
   const boTxt = bp.kgs[0] === bp.kgs[1] ? kgf(bp.kgs[0]) : kgf(bp.kgs[0]) + ' / ' + kgf(bp.kgs[1]);
   const boPl = bp.kgs[0] === bp.kgs[1] ? plateTxt(bp.kgs[0]) : bp.kgs.map(plateTxt).join(' | ');
-  const repTxt = i.wk === 1 || (i.last && lastReps > sl.top) ? `aim ${sl.top}` : `fight for ${lastReps}+`;
+  const repTxt = i.wk === 1 || (i.last && (lastReps > sl.top || i.last.recal)) ? `aim ${sl.top}` : `fight for ${lastReps}+`;
   h += `<div class="targets"><div class="tgt"><div class="l">Top set</div><div class="v">${kgf(i.target)}<small> ${i.assist ? 'kg assist' : i.pull ? 'kg added' : 'kg'}</small></div>${i.barbell ? `<div class="tiny plates">${esc(plateTxt(i.target))}</div>` : ''}<div class="tiny mut">${sl.bottom}–${sl.top} reps · ${repTxt}${i.last ? ` · last ${kgf(i.last.log.kg)}×${lastReps}` : ''}</div></div>
   <div class="tgt"><div class="l">Back-off ×2</div>${i.assist ? `<div class="v" id="bov-${id}">${boTxt}<small> kg assist</small></div><div class="tiny mut">same or more assist, strict, to failure</div>` : i.pull ? `<div class="v" style="font-size:15px;padding-top:4px">Bodyweight / lighter belt</div><div class="tiny mut">strict, to failure</div>` : `<div class="v" id="bov-${id}">${boTxt}<small> kg</small></div>${i.barbell ? `<div class="tiny plates" id="bop-${id}">${esc(boPl)}</div>` : ''}<div class="tiny mut">~80%${i.barbell ? ' (rounded down)' : ''}, strict, to failure</div>`}</div></div>
   <div class="why small"><div>↑ <b>Top:</b> ${esc(i.why)}</div>${bp.why ? `<div id="bow-${id}">↳ <b>Back-offs:</b> ${esc(bp.why)}</div>` : ''}</div>
