@@ -269,28 +269,52 @@ function evalLc(lcId) {
   rows.forEach((l, i) => {
     const prev = i > 0 ? rows[i - 1] : null;
     const wk = i + 1;
-    // no-progress flag: progress = heavier, or same weight with more reps
-    const flag = prev ? ((l.kg > prev.kg || (l.kg === prev.kg && l.reps > prev.reps)) ? 0 : 1) : 0;
+    // A rep drop only counts against him when the load was the same or lower, or the e1RM fell:
+    // fewer reps with a heavier load (and an e1RM that held or rose) is expected progress.
+    const e1 = e1rm(l.kg, l.reps), pe1 = prev ? e1rm(prev.kg, prev.reps) : null;
+    const e1Fell = isNum(e1) && isNum(pe1) && e1 < pe1;
+    const realDrop = !!prev && l.reps < prev.reps && (l.kg <= prev.kg || e1Fell);
+    // no-progress flag: progress = heavier (e1RM not down), or same weight with more reps
+    const flag = prev ? (((l.kg > prev.kg && !e1Fell) || (l.kg === prev.kg && l.reps > prev.reps)) ? 0 : 1) : 0;
     const prevFlag = i > 0 ? out[i - 1].flag : 0;
     let status;
     if (l.reps <= bottom) status = 'ROTATE - bottom of range';
     else if (flag === 1 && prevFlag === 1) status = 'ROTATE - 2 wks no progress';
+    else if (realDrop && prev.reps - l.reps >= 2) status = 'WATCH - reps fell 2+';
     else if (flag === 1) status = 'WATCH - no progress this week';
-    else if (wk === 2 && l.reps < top) status = 'WATCH - reps dropped early (jump too big?)';
-    else if (wk > 1 && prev && prev.reps - l.reps >= 2) status = 'WATCH - reps fell 2+';
+    else if (wk === 2 && l.reps < top && realDrop) status = 'WATCH - reps dropped early (jump too big?)';
     else if (wk === 1) status = 'START';
     else status = 'PROGRESSING';
     const p = status.startsWith('ROTATE') ? {next:null, why:''} : planTop(ex, l, jump, top);
-    out.push({log:l, wk, e1:e1rm(l.kg, l.reps), flag, status, next:p.next, why:p.why, recal:!!p.recal, nextBo: p.next == null ? null : backOff(ex, p.next)});
+    out.push({log:l, wk, e1, flag, status, next:p.next, why:p.why, recal:!!p.recal, nextBo: p.next == null ? null : backOff(ex, p.next)});
   });
   return out;
 }
 
 /* ---- Performance-based targets (IP Method) ----
    Top set = the higher of (a) last week's top set + jump and (b) the weight predicted for top-of-range reps from the
-   BEST Brzycki e1RM across all of last week's sets (top set + both back-offs; >36 reps counts as at least weight + increment),
-   rounded down to plates. Assisted: the most effective set (least assistance at/over the top of the range), capped at 0.
+   BEST estimated 1RM across all of last week's sets (top set + both back-offs), rounded down to plates.
+   Estimator (e1rmNext): Brzycki on reps + reps in reserve (1 if the set went 1 rep past the top of the range, 2 if it
+   went 2+ past; none if it stopped on the target, so ordinary weeks stay +jump), Brzycki capped at 20 effective reps
+   with Epley's slope beyond.
+   Why: Josh's sets stop short of failure (same load later in the session gets MORE reps: squat 20×15 then 20×17;
+   bench 32.5×12 then 32.5×15 ×2; repeated back-offs with equal reps), so reps as logged understate strength –
+   plain Brzycki predicted 25 / 30 / – / 33 for week-2 squat / bench / T-bar / pulldown, he did 30 / 32.5 / 40 / 40.
+   But Brzycki's denominator blows up past ~20 reps (32.5×23 → a 14-rep max of 53) and is undefined from 37 reps,
+   so above 20 effective reps it continues on Epley's gentler straight line (defined for any reps).
+   Back-offs use the same capped curve but WITHOUT the 2-rep allowance (they are done tired, after the top set),
+   which keeps them a step under the top set instead of matching it. Assisted: the most effective set (least assistance at/over the top of the range), capped at 0.
    Rotate cases never get here (handled by the rotate flow). */
+const RIR_ASSUMED = 2, BRZ_MAX_REPS = 20;
+function e1rmNext(kg, reps, rir = RIR_ASSUMED) {
+  if (!isNum(kg) || kg < 0 || !isNum(reps) || reps <= 0 || !isNum(rir) || rir < 0) return null;
+  const rr = reps + rir, capped = Math.min(rr, BRZ_MAX_REPS);
+  return r1(kg * 36 / (37 - capped) * (rr > BRZ_MAX_REPS ? (30 + rr) / (30 + BRZ_MAX_REPS) : 1));
+}
+// reserve allowance only for sets that went PAST the top of the range (1 rep past → 1, 2+ past → 2): a set that
+// stops on the target is ordinary double progression (+jump), a set that sails past it is evidence the load was light
+const reserveFor = (r, top) => Math.max(0, Math.min(RIR_ASSUMED, r - top));
+const e1Note = rir => rir > 0 ? `counting ${rir} rep${rir > 1 ? 's' : ''} in reserve` : '';
 const setTxt = (kg, reps) => kgf(kg) + '×' + (isNum(reps) ? reps : '?');
 function planTop(ex, l, jump, top) {
   const j = jumpFor(ex, jump), plus = barMin(ex, r2(l.kg + j)), bar = isBarbell(ex), asst = isAssisted(ex);
@@ -302,8 +326,7 @@ function planTop(ex, l, jump, top) {
     let cand, e = null;
     if (asst) cand = r > top + 2 ? w + 2 * Math.abs(j) : r >= top ? w + Math.abs(j) : null;   // no e1RM for assistance: most effective set wins
     else if (isPullUp(ex)) cand = null;                                                    // weighted pull-up: added-load e1RM is meaningless
-    else if (r >= 37) cand = bar ? barRound(w + j) : r2(w + j);                            // Brzycki undefined: at least weight + increment
-    else { e = e1rm(w, r); cand = startFromE1(e, top); if (bar) cand = barFloor(cand); }
+    else { e = e1rmNext(w, r, reserveFor(r, top)); cand = startFromE1(e, top); if (bar) cand = barFloor(cand); }
     if (isNum(cand) && (!best || cand > best.cand)) best = {lab, w, r, e, cand};
   });
   if (asst) {
@@ -312,14 +335,15 @@ function planTop(ex, l, jump, top) {
       : `Last week ${setTxt(l.kg, l.reps)} → ${kgf(Math.abs(j))} kg less assistance${plus >= 0 ? ' (capped at 0 = bodyweight)' : ''}`};
   }
   if (best && best.cand > plus) {
-    const how = isNum(best.e) ? `e1RM ${kgf(best.e)}` : `over 36 reps, so at least +${kgf(j)}`;
+    const nt = e1Note(reserveFor(best.r, top)), how = `e1RM ${kgf(best.e)}${nt ? ` (${nt})` : ''}`;
     return {next:best.cand, recal:true, why:`Best set last week: ${best.lab} ${setTxt(best.w, best.r)}, ${how}, so top set ${kgf(best.cand)} for ~${top} reps`};
   }
-  const bx = best && isNum(best.e) ? `; best set (${best.lab} ${setTxt(best.w, best.r)}, e1RM ${kgf(best.e)}) predicts only ${kgf(best.cand)}` : '';
+  const bx = best && isNum(best.e) ? `; best set (${best.lab} ${setTxt(best.w, best.r)}, e1RM ${kgf(best.e)}${e1Note(reserveFor(best.r, top)) ? ', ' + e1Note(reserveFor(best.r, top)) : ''}) predicts only ${kgf(best.cand)}` : '';
   return {next:plus, why:`+${kgf(j)} from last week (${setTxt(l.kg, l.reps)})${bx}`};
 }
 /* Back-offs: every set progresses from ITS OWN last-week weight and reps (logs taken at face value – no caps):
-   reps ≥ top+3 → +1 increment, or more if that set's e1RM says so (weight for top-of-range reps, rounded down to plates);
+   reps ≥ top+3 → +1 increment, or more if that set's e1RM says so (capped curve, no reserve allowance; weight for
+   top-of-range reps, rounded down to plates);
    in range → hold, or ~80% of the planned top set if that is higher (assisted: hold → 1 increment less assistance);
    below the bottom → −1 increment. No history for a set → ~80% of the planned top set (assisted: same as the top set). */
 function planBo(id, topKg, lastLog) {
@@ -336,7 +360,7 @@ function planBo(id, topKg, lastLog) {
     const was = setTxt(w, r);
     if (r >= sl.top + 3) {
       let up = bar ? barRound(w + inc) : r2(w + inc), via = `+${kgf(inc)}`;
-      const e = asst ? null : e1rm(w, r), c = isNum(e) ? (bar ? barFloor(startFromE1(e, sl.top)) : startFromE1(e, sl.top)) : null;
+      const e = asst ? null : e1rmNext(w, r, 0), c = isNum(e) ? (bar ? barFloor(startFromE1(e, sl.top)) : startFromE1(e, sl.top)) : null;
       if (isNum(c) && c > up) { up = c; via = `e1RM ${kgf(e)} → ${kgf(c)}`; }
       if (!asst && base > up) { up = base; via = `~80% of ${kgf(topKg)} = ${kgf(base)}`; }
       parts.push(`set ${k + 1}: ${was}, well above ${sl.top} → ${via}${asst ? ' (less assistance)' : ''}`); return fix(up);
