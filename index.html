@@ -16,10 +16,14 @@
 <style>
 :root{--bg:#0b0f16;--bg2:#121824;--card:#161e2c;--card2:#1c2638;--line:#263248;--tx:#e6edf6;--mut:#8b9ab3;--acc:#22d3a6;--acc2:#a3e635;--warn:#f5b942;--bad:#f2555a;--info:#5aa9ff;--r:16px;--safe-b:env(safe-area-inset-bottom,0px);--safe-t:env(safe-area-inset-top,0px)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{height:100%;overflow:hidden}
+/* iOS: no text autosizing (rotating to landscape and back used to leave the text bigger) */
+html{height:100%;overflow:hidden;-webkit-text-size-adjust:100%;text-size-adjust:100%}
 html,body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 /* App shell: body is a fixed full-screen column; only <main> scrolls, so header + tab bar can never drift (iOS standalone) */
-body{position:fixed;inset:0;height:100%;overflow:hidden;display:flex;flex-direction:column;overscroll-behavior:none}
+/* full screen incl. the home-indicator area: fixed inset:0 + dynamic viewport height (100vh fallback); html is painted the
+   tab-bar colour so any sliver iOS leaves below the shell matches the tab bar instead of showing a gap */
+html{background:#121824}
+body{position:fixed;inset:0;height:100vh;height:100dvh;min-height:100%;overflow:hidden;padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);display:flex;flex-direction:column;overscroll-behavior:none}
 header.top{flex:none;position:relative;z-index:20;background:rgba(11,15,22,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);padding:calc(var(--safe-t) + 10px) 16px 10px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
 header.top h1{font-size:19px;margin:0;font-weight:750;letter-spacing:.2px;flex:1}
 header.top .sub{color:var(--mut);font-size:13px}
@@ -118,7 +122,7 @@ table.t td{padding:8px 4px;border-bottom:1px solid #1d2638;vertical-align:top}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:14px}
 .kv div:nth-child(odd){color:var(--mut)}
 .sheet-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;display:flex;align-items:flex-end;justify-content:center}
-.sheet{background:#121824;width:100%;max-width:720px;max-height:92vh;overflow-y:auto;border-radius:22px 22px 0 0;padding:8px 16px calc(20px + var(--safe-b));border-top:1px solid var(--line)}
+.sheet{background:#121824;width:100%;max-width:720px;max-height:92vh;max-height:92dvh;overflow-y:auto;border-radius:22px 22px 0 0;padding:8px 16px calc(20px + var(--safe-b));border-top:1px solid var(--line)}
 .sheet.anim{animation:up .2s ease-out}
 .sheet .grab{width:42px;height:5px;border-radius:3px;background:#34425c;margin:4px auto 10px}
 .sheet h2{margin-top:2px}
@@ -1251,8 +1255,9 @@ const ACTIONS = {
     e.done[k] = !e.done[k]; b.classList.toggle('on', e.done[k]);
     if (e.done[k]) {
       b.parentElement.querySelectorAll('input').forEach(inp => { if (inp.value === '' && inp.placeholder !== '' && !isNaN(parseFloat(inp.placeholder))) { inp.value = parseFloat(inp.placeholder); draftSet(inp.dataset.draft, inp.value); } });
-      const last = isAcc(id) ? k === 1 : k === 2;
-      if (!last) startTimer(isAcc(id) ? 105 : (k === 0 && SLOTDEF[id].type === 'Key movement' ? 210 : 150));
+      // rest timer starts (or restarts) on every ticked set, incl. the last set of a lift – except the session's very last set
+      const ticks = [...document.querySelectorAll('[data-act=tick]')], allDone = ticks.length > 0 && ticks.every(x => x.classList.contains('on'));
+      if (!allDone) startTimer(isAcc(id) ? 105 : (k === 0 && SLOTDEF[id].type === 'Key movement' ? 210 : 150));
     }
     save();
   },
